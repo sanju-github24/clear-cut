@@ -1,4 +1,3 @@
-backend/bg_removal_checkpoint.pth
 __pycache__/
 *.pyc
 node_modules/
