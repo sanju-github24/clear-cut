@@ -1,24 +1,23 @@
 """
-Background Removal API
-Run: uvicorn main:app --reload --host 0.0.0.0 --port 8000
+ClearCut Background Removal API
+Run: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+Uses ONNX runtime instead of PyTorch for low memory usage (~150MB).
+Fits Render free tier (512MB RAM).
 """
 
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import torch
-import torch.nn as nn
-import segmentation_models_pytorch as smp
+import onnxruntime as ort
 import cv2
 import numpy as np
 from PIL import Image
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
 import io
 import os
 
-app = FastAPI(title="Background Removal API")
-
+# ── App ──────────────────────────────────────────────────
+app = FastAPI(title="ClearCut API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,115 +25,92 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Config ──────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────
 IMG_SIZE   = 320
-DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_PATH = os.getenv("MODEL_PATH", "bg_removal_checkpoint.pth")
+MODEL_PATH = os.getenv("MODEL_PATH", "model.onnx")
 
-# ── Load model ──────────────────────────────────────────
-print(f"Loading model from {MODEL_PATH} on {DEVICE}...")
+# ── Load ONNX model ──────────────────────────────────────
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(
+        f"\n❌ ONNX model not found at '{MODEL_PATH}'.\n"
+        f"   Run export_onnx.py first to convert your .pth to model.onnx\n"
+    )
 
-model = smp.Unet(
-    encoder_name    = "resnet34",
-    encoder_weights = None,
-    in_channels     = 3,
-    classes         = 1,
-    activation      = "sigmoid",
-).to(DEVICE)
+print(f"🔧 Loading ONNX model from {MODEL_PATH} ...")
+sess_options = ort.SessionOptions()
+sess_options.intra_op_num_threads = 2   # limit CPU threads on free tier
+session = ort.InferenceSession(
+    MODEL_PATH,
+    sess_options=sess_options,
+    providers=["CPUExecutionProvider"],
+)
+INPUT_NAME  = session.get_inputs()[0].name
+OUTPUT_NAME = session.get_outputs()[0].name
+print("✅ Model ready!")
 
-checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
-
-# Handle both plain state_dict and full checkpoint
-if "model_state" in checkpoint:
-    model.load_state_dict(checkpoint["model_state"])
-else:
-    model.load_state_dict(checkpoint)
-
-model.eval()
-print("✅ Model loaded!")
-
-# ── Preprocessing ────────────────────────────────────────
-transform = A.Compose([
-    A.Resize(IMG_SIZE, IMG_SIZE),
-    A.Normalize(mean=(0.485, 0.456, 0.406),
-                std =(0.229, 0.224, 0.225)),
-    ToTensorV2(),
-])
+# ── Mean/std for normalization (ImageNet) ────────────────
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
+# ── Inference ────────────────────────────────────────────
 def predict_mask(img_rgb: np.ndarray, threshold: float = 0.5) -> np.ndarray:
-    """Run model inference, return binary mask (H, W) uint8 0/255."""
     h, w = img_rgb.shape[:2]
-    aug    = transform(image=img_rgb)
-    tensor = aug["image"].unsqueeze(0).to(DEVICE)
 
-    with torch.no_grad():
-        pred = model(tensor)[0, 0].cpu().numpy()   # (320, 320) float
+    # Preprocess
+    resized = cv2.resize(img_rgb, (IMG_SIZE, IMG_SIZE))
+    tensor  = (resized.astype(np.float32) / 255.0 - MEAN) / STD  # H W C
+    tensor  = tensor.transpose(2, 0, 1)[np.newaxis]               # 1 C H W
 
+    # Run
+    pred = session.run([OUTPUT_NAME], {INPUT_NAME: tensor})[0]    # 1 1 H W
+    pred = pred[0, 0]                                              # H W
+
+    # Resize back & binarize
     mask = cv2.resize(pred, (w, h))
-    mask = (mask > threshold).astype(np.uint8) * 255
-    return mask
+    return (mask > threshold).astype(np.uint8) * 255
 
 
 def apply_background(img_rgb: np.ndarray, mask: np.ndarray, bg: str) -> Image.Image:
-    """
-    Composite foreground over chosen background and return a PIL RGBA image.
-    bg: 'transparent' | 'white' | 'black' | '#rrggbb'
-    """
-    rgba = np.dstack([img_rgb, mask])           # H W 4
-    pil  = Image.fromarray(rgba, "RGBA")
-
+    rgba = Image.fromarray(np.dstack([img_rgb, mask]), "RGBA")
     if bg == "transparent":
-        return pil
-
-    if bg == "white":
-        color = (255, 255, 255, 255)
-    elif bg == "black":
-        color = (0, 0, 0, 255)
-    else:                                        # hex color
-        hex_ = bg.lstrip("#")
-        r, g, b = int(hex_[0:2], 16), int(hex_[2:4], 16), int(hex_[4:6], 16)
-        color = (r, g, b, 255)
-
-    canvas = Image.new("RGBA", pil.size, color)
-    canvas.paste(pil, mask=pil.split()[3])
-    return canvas.convert("RGB") if bg != "transparent" else canvas
+        return rgba
+    color = {"white": (255, 255, 255, 255), "black": (0, 0, 0, 255)}.get(bg)
+    if color is None:                   # hex color e.g. #ff0000
+        h = bg.lstrip("#")
+        color = (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
+    canvas = Image.new("RGBA", rgba.size, color)
+    canvas.paste(rgba, mask=rgba.split()[3])
+    return canvas
 
 
-# ── Endpoints ────────────────────────────────────────────
-
+# ── Routes ───────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "device": DEVICE}
+    return {"status": "ok", "model": MODEL_PATH}
 
 
 @app.post("/remove-background")
 async def remove_background(
-    file      : UploadFile = File(...),
-    background: str        = Form("white"),    # white | black | transparent | #hex
-    threshold : float      = Form(0.5),
+    file:       UploadFile = File(...),
+    background: str        = Form("transparent"),
+    threshold:  float      = Form(0.5),
 ):
-    # Read image
     data    = await file.read()
-    nparr   = np.frombuffer(data, np.uint8)
-    img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    img_bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
 
     if img_bgr is None:
-        return JSONResponse(status_code=400, content={"error": "Invalid image"})
+        return JSONResponse(status_code=400, content={"error": "Invalid image file."})
 
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    mask    = predict_mask(img_rgb, threshold)
+    result  = apply_background(img_rgb, mask, background)
 
-    # Predict
-    mask   = predict_mask(img_rgb, threshold)
-    result = apply_background(img_rgb, mask, background)
-
-    # Stream back as PNG
     buf = io.BytesIO()
     result.save(buf, format="PNG")
     buf.seek(0)
-
     return StreamingResponse(
         buf,
         media_type="image/png",
-        headers={"Content-Disposition": f'attachment; filename="result.png"'},
+        headers={"Content-Disposition": 'attachment; filename="result.png"'},
     )
