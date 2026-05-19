@@ -1,10 +1,6 @@
 fastapi
 uvicorn[standard]
 python-multipart
-torch
-torchvision
-segmentation-models-pytorch
-albumentations
+onnxruntime
 opencv-python-headless
 Pillow
-numpy
